@@ -133,6 +133,7 @@ class Env(object):
     message = None
     context = None
     register = None
+    my_values = None
     def __init__(self):
         self.message_tree = TreeNode('')
         self.scope = self.message_tree
@@ -150,8 +151,8 @@ class Env(object):
             # if the child doesn't be founded, it must be in this file
             return type_name[len('.'.join(self.package)) + 1:]
         if node.filename != self.filename:
-            return node.filename + '_pb.' + node.get_local_name()
-        return node.get_local_name()
+            return (node.filename + '_pb.', node.get_local_name())
+        return ('', node.get_local_name())
 
     def lookup_name(self, name):
         names = name.split('.')
@@ -197,6 +198,7 @@ class Env(object):
         self.context = []
         self.message = []
         self.register = []
+        self.my_values = {}
 
     def _build_nodes(self, node, names):
         parent = node
@@ -246,20 +248,24 @@ DEFAULT_VALUE = {
     FDP.TYPE_SINT64         : '0',
 }
 
+# def code_gen_enum_item(index, enum_value, env):
+#     full_name = env.get_local_name() + '.' + enum_value.name
+#     obj_name = full_name.upper().replace('.', '_') + '_ENUM'
+#     env.descriptor.append(
+#         "local %s = protobuf.EnumValueDescriptor();\n"% obj_name
+#     )
+
+#     context = Writer(obj_name)
+#     context('.name = "%s"\n' % enum_value.name)
+#     context('.index = %d\n' % index)
+#     context('.number = %d\n' % enum_value.number)
+
+#     env.my_values[enum_value.name] = enum_value.number
+#     env.context.append(context.getvalue())
+#     return obj_name
 def code_gen_enum_item(index, enum_value, env):
-    full_name = env.get_local_name() + '.' + enum_value.name
-    obj_name = full_name.upper().replace('.', '_') + '_ENUM'
-    env.descriptor.append(
-        "local %s = protobuf.EnumValueDescriptor();\n"% obj_name
-    )
-
-    context = Writer(obj_name)
-    context('.name = "%s"\n' % enum_value.name)
-    context('.index = %d\n' % index)
-    context('.number = %d\n' % enum_value.number)
-
-    env.context.append(context.getvalue())
-    return obj_name
+    env.my_values[enum_value.name] = enum_value.number
+    return "new_enum_item(\"%s\", %d, %d)" % (enum_value.name, index, enum_value.number)
 
 def code_gen_enum(enum_desc, env):
     env.enter(enum_desc.name)
@@ -285,9 +291,9 @@ def code_gen_enum(enum_desc, env):
 def code_gen_field(index, field_desc, env):
     full_name = env.get_local_name() + '.' + field_desc.name
     obj_name = full_name.upper().replace('.', '_') + '_FIELD'
-    env.descriptor.append(
-        "local %s = protobuf.FieldDescriptor();\n"% obj_name
-    )
+    # env.descriptor.append(
+    #     "local %s = protobuf.FieldDescriptor();\n"% obj_name
+    # )
 
     context = Writer(obj_name)
 
@@ -304,7 +310,10 @@ def code_gen_field(index, field_desc, env):
         if field_desc.type == FDP.TYPE_STRING:
             context('.default_value = "%s"\n'%value)
         else:
-            context('.default_value = %s\n'%value)
+            if env.my_values.has_key(value):
+                context('.default_value = %d\n'%env.my_values[value])
+            else:    
+                context('.default_value = %s\n'%value)
     else:
         context('.has_default_value = false\n')
         if field_desc.label == FDP.LABEL_REPEATED:
@@ -316,22 +325,31 @@ def code_gen_field(index, field_desc, env):
         context('.default_value = %s\n' % default_value)
 
     if field_desc.HasField('type_name'):
-        type_name = env.get_ref_name(field_desc.type_name).upper().replace('.', '_')
+        (file_name, type_name) = env.get_ref_name(field_desc.type_name)
+        # type_name = type_name.upper().replace('.', '_')
+        type_name = file_name + type_name.upper().replace('.', '_')
         if field_desc.type == FDP.TYPE_MESSAGE:
             context('.message_type = %s\n' % type_name)
         else:
             context('.enum_type = %s\n' % type_name)
 
     if field_desc.HasField('extendee'):
-        type_name = env.get_ref_name(field_desc.extendee)
+        (file_name, type_name) = env.get_ref_name(field_desc.extendee)
         env.register.append(
             "%s.RegisterExtension(%s)\n" % (type_name, obj_name)
         )
 
     context('.type = %d\n' % field_desc.type)
     context('.cpp_type = %d\n\n' % CPP_TYPE[field_desc.type])
-    env.context.append(context.getvalue())
-    return obj_name
+
+    # env.context.append(context.getvalue())
+    # return obj_name
+    my_patch = '(function ()\n'
+    my_patch += 'local %s = protobuf.FieldDescriptor();\n'% obj_name
+    my_patch += context.getvalue()
+    my_patch += ('return %s\n' % obj_name)
+    my_patch += 'end)()\n'
+    return my_patch
 
 def code_gen_message(message_descriptor, env, containing_type = None):
     env.enter(message_descriptor.name)
@@ -374,7 +392,7 @@ def code_gen_message(message_descriptor, env, containing_type = None):
     if containing_type:
         context('.containing_type = %s\n' % containing_type)
 
-    env.message.append('%s = protobuf.Message(%s)\n' % (full_name,
+    env.message.append('%s = protobuf.Message(%s),\n' % (full_name,
                                                         obj_name))
 
     env.context.append(context.getvalue())
@@ -400,7 +418,7 @@ def code_gen_file(proto_file, env, is_gen):
     for enum_desc in proto_file.enum_type:
         code_gen_enum(enum_desc, env)
         for enum_value in enum_desc.value:
-            env.message.append('%s = %d\n' % (enum_value.name,
+            env.message.append('%s = %d,\n' % (enum_value.name,
                                               enum_value.number))
 
     for msg_desc in proto_file.message_type:
@@ -412,17 +430,31 @@ def code_gen_file(proto_file, env, is_gen):
         lua('local protobuf = require "protobuf"\n')
         for i in includes:
             lua('local %s_pb = require("%s_pb")\n' % (i, i))
-        lua("module('%s_pb')\n" % env.filename)
+        lua("-- my patch\n")
+        lua("-- module('%s_pb')\n" % env.filename)
+        lua("""\
+local new_enum_item = function (name, index, number)
+    local item = protobuf.EnumValueDescriptor()
+    item.name = name
+    item.index = index
+    item.number = number
+    return item
+end
+""")
 
         lua('\n\n')
         map(lua, env.descriptor)
         lua('\n')
         map(lua, env.context)
         lua('\n')
+        lua('-- message:\n')
+        lua('return { -- my patch\n')
         env.message.sort()
         map(lua, env.message)
         lua('\n')
+        lua('-- register:\n')
         map(lua, env.register)
+        lua('} -- my patch')
 
         _files[env.filename+ '_pb.lua'] = lua.getvalue()
     env.exit_file()
